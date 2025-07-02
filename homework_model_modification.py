@@ -1,5 +1,5 @@
-# homework_model_modification.py
-
+import os
+import logging
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,7 +9,42 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, \
     ConfusionMatrixDisplay
 
-from regression_basics.utils import make_regression_data, make_classification_data, mse, RegressionDataset, ClassificationDataset
+from regression_basics.utils import make_regression_data, make_classification_data, mse, RegressionDataset, \
+    ClassificationDataset
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def save_model(model, model_name, metrics=None):
+    """Сохраняет модель в директорию models/"""
+    os.makedirs('models', exist_ok=True)
+    model_path = f'models/{model_name}.pth'
+
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'model_class': model.__class__.__name__,
+        'input_features': model.linear.in_features,
+        'metrics': metrics or {}
+    }, model_path)
+
+    logger.info(f"Модель сохранена: {model_path}")
+    return model_path
+
+
+def load_model(model_class, model_name, in_features):
+    """Загружает модель из директории models/"""
+    model_path = f'models/{model_name}.pth'
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Модель не найдена: {model_path}")
+
+    checkpoint = torch.load(model_path)
+    model = model_class(in_features=in_features)
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    logger.info(f"Модель загружена: {model_path}")
+    return model, checkpoint.get('metrics', {})
 
 
 # 1.1 Модифицированная линейная регрессия с L1/L2 и early stopping
@@ -38,15 +73,20 @@ def train_linreg_with_early_stopping(
     patience_counter = 0
     best_state = None
 
+    logger.info("Начинаем обучение линейной регрессии с early stopping")
+
     for epoch in range(1, epochs + 1):
         model.train()
+        train_loss = 0
         for X_batch, y_batch in dataloader:
             optimizer.zero_grad()
             y_pred = model(X_batch)
             loss = criterion(y_pred, y_batch) + model.regularization_loss()
             loss.backward()
             optimizer.step()
-        # Early stopping по валидационной выборке
+            train_loss += loss.item()
+
+        # Валидация
         model.eval()
         val_losses = []
         with torch.no_grad():
@@ -54,7 +94,10 @@ def train_linreg_with_early_stopping(
                 y_pred = model(X_val)
                 val_loss = criterion(y_pred, y_val)
                 val_losses.append(val_loss.item())
+
         avg_val_loss = np.mean(val_losses)
+        avg_train_loss = train_loss / len(dataloader)
+
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
             best_state = model.state_dict()
@@ -62,8 +105,18 @@ def train_linreg_with_early_stopping(
         else:
             patience_counter += 1
             if patience_counter >= patience:
+                logger.info(f"Early stopping на эпохе {epoch}")
                 model.load_state_dict(best_state)
                 break
+
+        if epoch % 10 == 0:
+            logger.info(f'Epoch {epoch}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}')
+
+    # Сохраняем лучшую модель
+    final_metrics = {'best_val_loss': best_loss, 'epochs_trained': epoch}
+    save_model(model, 'linear_regression_best', final_metrics)
+
+    return best_loss
 
 
 # 1.2 Логистическая регрессия с поддержкой мультикласса и метриками
@@ -81,14 +134,30 @@ def train_logreg_multiclass(
 ):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=lr)
+    logger.info("Начинаем обучение логистической регрессии")
     for epoch in range(1, epochs + 1):
         model.train()
+        train_loss = 0
         for X_batch, y_batch in dataloader:
             optimizer.zero_grad()
             logits = model(X_batch)
             loss = criterion(logits, y_batch.squeeze().long())
             loss.backward()
             optimizer.step()
+            train_loss += loss.item()
+
+        if epoch % 20 == 0:
+            avg_train_loss = train_loss / len(dataloader)
+            logger.info(f'Epoch {epoch}: Train Loss: {avg_train_loss:.4f}')
+
+        # Оценка и сохранение
+        precision, recall, f1, roc_auc, _, _ = evaluate_multiclass(model, val_dataloader, num_classes=3)
+        metrics = {'precision': precision, 'recall': recall, 'f1': f1, 'roc_auc': roc_auc}
+        save_model(model, 'logistic_regression_multiclass', metrics)
+
+        logger.info(f"Финальные метрики: Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+
+        return metrics
 
 
 def evaluate_multiclass(model, dataloader, num_classes):
@@ -127,6 +196,8 @@ def plot_confusion_matrix(y_true, y_pred, class_names=None):
 
 # Пример использования для регрессии:
 if __name__ == "__main__":
+    os.makedirs('models', exist_ok=True)
+    os.makedirs('plots', exist_ok=True)
     # Линейная регрессия с L1/L2 и early stopping
     X, y = make_regression_data(n=200, noise=0.1, source='random')
     dataset = RegressionDataset(X, y)
